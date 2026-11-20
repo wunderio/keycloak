@@ -23,6 +23,9 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.TreeSet;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import jakarta.ws.rs.core.Response;
 
@@ -39,6 +42,8 @@ import org.keycloak.http.simple.SimpleHttp;
 import org.keycloak.http.simple.SimpleHttpRequest;
 import org.keycloak.http.simple.SimpleHttpResponse;
 import org.keycloak.models.KeycloakSession;
+import org.keycloak.models.RealmModel;
+import org.keycloak.models.UserModel;
 import org.keycloak.protocol.oidc.TokenExchangeContext;
 import org.keycloak.services.ErrorResponseException;
 import org.keycloak.services.messages.Messages;
@@ -67,6 +72,7 @@ public class GitHubIdentityProvider extends AbstractOAuth2IdentityProvider imple
     public static final String APPLICATIONS_FRAGMENT = "/applications";
     public static final String PROFILE_FRAGMENT = "/user";
     public static final String EMAIL_FRAGMENT = "/user/emails";
+    public static final String TEAMS_FRAGMENT = "/user/teams";
     public static final String DEFAULT_APPLICATIONS_URL = DEFAULT_API_URL + APPLICATIONS_FRAGMENT;
     public static final String DEFAULT_PROFILE_URL = DEFAULT_API_URL + PROFILE_FRAGMENT;
     public static final String DEFAULT_EMAIL_URL = DEFAULT_API_URL + EMAIL_FRAGMENT;
@@ -94,6 +100,19 @@ public class GitHubIdentityProvider extends AbstractOAuth2IdentityProvider imple
      * GitHub address in these domains is used instead of the public or primary one.
      */
     protected static final String EMAIL_DOMAINS_KEY = "emailDomains";
+
+    /**
+     * User attribute that holds the slugs of the user's GitHub teams in the allowed organizations. Rewritten on every
+     * GitHub login (removed when there are none), so a protocol mapper can emit it as the token's groups claim.
+     */
+    public static final String TEAMS_ATTRIBUTE = "github_teams";
+    /** Brokered context key that carries the teams from the GitHub API calls to {@link #storeTeams}. */
+    static final String TEAMS_CONTEXT_KEY = "github.teams";
+    /** GitHub's largest page size for /user/teams. */
+    static final int TEAMS_PAGE_SIZE = 100;
+    /** Stop following next links after this many pages (10,000 teams), in case of a link loop. */
+    static final int TEAMS_MAX_PAGES = 100;
+    private static final Pattern NEXT_LINK = Pattern.compile("<([^>]*)>\\s*;\\s*rel=\"next\"");
 
     private final String authUrl;
     private final String tokenUrl;
@@ -200,6 +219,11 @@ public class GitHubIdentityProvider extends AbstractOAuth2IdentityProvider imple
 
                     checkOrganizationMembership(accessToken, user.getUsername());
 
+                    // Always set, so a user loses the teams attribute when the organizations setting is cleared.
+                    List<String> organizations = parseCommaSeparated(getConfig().getConfig().get(ORGANIZATIONS_KEY));
+                    user.getContextData().put(TEAMS_CONTEXT_KEY,
+                            collectTeams(apiUrl, organizations, url -> fetchTeamsPage(url, accessToken)));
+
                     return user;
 		} catch (IdentityBrokerException e) {
 			throw e;
@@ -242,6 +266,112 @@ public class GitHubIdentityProvider extends AbstractOAuth2IdentityProvider imple
 		}
 	}
 
+	/** One page of GET /user/teams: HTTP status, JSON body (null unless successful) and the Link header. */
+	record TeamsPage(int status, JsonNode body, String link) {
+	}
+
+	@FunctionalInterface
+	interface TeamsPageFetcher {
+		TeamsPage fetch(String url) throws IOException;
+	}
+
+	private TeamsPage fetchTeamsPage(String url, String accessToken) throws IOException {
+		try (SimpleHttpResponse response = SimpleHttp.create(session).doGet(url)
+				.header("Authorization", "Bearer " + accessToken)
+				.header("Accept", "application/json")
+				.asResponse()) {
+			int status = response.getStatus();
+			boolean ok = Response.Status.Family.familyOf(status) == Response.Status.Family.SUCCESSFUL;
+			return new TeamsPage(status, ok ? response.asJson() : null, response.getFirstHeader("Link"));
+		}
+	}
+
+	/**
+	 * Collect the slugs of the user's teams (GET /user/teams, every page) that belong to one of {@code organizations},
+	 * sorted and without duplicates. Returns no teams when {@code organizations} is empty, and also when any page fails:
+	 * a user without groups gets no access, which is safer than failing the login or keeping a partial list.
+	 */
+	static List<String> collectTeams(String apiUrl, List<String> organizations, TeamsPageFetcher fetcher) {
+		if (organizations.isEmpty()) {
+			return new ArrayList<>();
+		}
+		TreeSet<String> teams = new TreeSet<>();
+		String url = apiUrl + TEAMS_FRAGMENT + "?per_page=" + TEAMS_PAGE_SIZE;
+		try {
+			for (int pages = 0; url != null; pages++) {
+				if (pages == TEAMS_MAX_PAGES) {
+					logger.warnf("GitHub teams endpoint has more than %d pages, ignoring the user's teams", TEAMS_MAX_PAGES);
+					return new ArrayList<>();
+				}
+				// The access token goes with every request, so never follow a link off the API host.
+				if (!url.startsWith(apiUrl + "/")) {
+					logger.warnf("GitHub teams endpoint links outside %s (%s), ignoring the user's teams", apiUrl, url);
+					return new ArrayList<>();
+				}
+				TeamsPage page = fetcher.fetch(url);
+				if (Response.Status.Family.familyOf(page.status()) != Response.Status.Family.SUCCESSFUL
+						|| page.body() == null || !page.body().isArray()) {
+					logger.warnf("GitHub teams endpoint returned an error (%d), ignoring the user's teams", page.status());
+					return new ArrayList<>();
+				}
+				for (JsonNode team : page.body()) {
+					String slug = team.path("slug").asText("");
+					String org = team.path("organization").path("login").asText("").toLowerCase(Locale.ROOT);
+					if (!slug.isEmpty() && organizations.contains(org)) {
+						teams.add(slug);
+					}
+				}
+				url = nextLink(page.link());
+			}
+		} catch (Exception e) {
+			logger.warnf(e, "Could not read the user's GitHub teams, ignoring them");
+			return new ArrayList<>();
+		}
+		return new ArrayList<>(teams);
+	}
+
+	/** The rel="next" URL of a GitHub Link header, or null on the last page. */
+	static String nextLink(String linkHeader) {
+		if (linkHeader == null) {
+			return null;
+		}
+		Matcher matcher = NEXT_LINK.matcher(linkHeader);
+		return matcher.find() ? matcher.group(1) : null;
+	}
+
+	@Override
+	public void importNewUser(KeycloakSession session, RealmModel realm, UserModel user, BrokeredIdentityContext context) {
+		super.importNewUser(session, realm, user, context);
+		storeTeams(user, context);
+	}
+
+	@Override
+	public void updateBrokeredUser(KeycloakSession session, RealmModel realm, UserModel user, BrokeredIdentityContext context) {
+		super.updateBrokeredUser(session, realm, user, context);
+		storeTeams(user, context);
+	}
+
+	/**
+	 * Replace the user's {@link #TEAMS_ATTRIBUTE} with the teams found at this login, or remove it when there are none.
+	 * Written straight to the user model on every login, whatever the provider's sync mode, so leaving a GitHub team
+	 * takes effect at the next login.
+	 */
+	static void storeTeams(UserModel user, BrokeredIdentityContext context) {
+		Object teams = context.getContextData().get(TEAMS_CONTEXT_KEY);
+		if (!(teams instanceof List<?> list)) {
+			return;
+		}
+		List<String> values = new ArrayList<>();
+		for (Object team : list) {
+			values.add(String.valueOf(team));
+		}
+		if (values.isEmpty()) {
+			user.removeAttribute(TEAMS_ATTRIBUTE);
+		} else {
+			user.setAttribute(TEAMS_ATTRIBUTE, values);
+		}
+	}
+
 	private String searchEmail(String accessToken) {
 		JsonNode emails = fetchEmails(accessToken);
 		if (emails.isArray()) {
@@ -281,17 +411,24 @@ public class GitHubIdentityProvider extends AbstractOAuth2IdentityProvider imple
 	 * Parse the comma-separated email domains setting into lower-case domains, in order.
 	 */
 	static List<String> parseEmailDomains(String value) {
-		List<String> domains = new ArrayList<>();
+		return parseCommaSeparated(value);
+	}
+
+	/**
+	 * Parse a comma-separated setting into trimmed, lower-case, non-empty values, in order.
+	 */
+	static List<String> parseCommaSeparated(String value) {
+		List<String> values = new ArrayList<>();
 		if (value == null) {
-			return domains;
+			return values;
 		}
-		for (String domain : value.split(",")) {
-			String trimmed = domain.trim().toLowerCase(Locale.ROOT);
+		for (String item : value.split(",")) {
+			String trimmed = item.trim().toLowerCase(Locale.ROOT);
 			if (!trimmed.isEmpty()) {
-				domains.add(trimmed);
+				values.add(trimmed);
 			}
 		}
-		return domains;
+		return values;
 	}
 
 	/**
